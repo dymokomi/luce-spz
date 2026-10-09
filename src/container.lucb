@@ -1,0 +1,176 @@
+## Reading and writing the SPZ container (format.lucb): the six packed
+## streams of a file, decompressed, and back. Version 4's zstd streams are
+## decompressed and compressed in parallel, one per worker; versions 1-3 are
+## one gzip stream. Extension records are read for the coordinate system
+## (Adobe's `SPZ_ADOBE_coordinate_system`); others are skipped with a warning.
+import memory
+from luce_std import parallel
+from luce_compress import gzip, zstd
+from format import magic, Header, read_header, read_legacy_header, read_u32, read_u64, write_u32, write_u64, write_common, header_bytes, legacy_header_bytes, extensions_flag
+from coordinates import rub, system_count
+from warnings import Warnings
+import errors
+
+## Extension types this package knows.
+let coordinate_extension: u32 = 0xADBE0003
+let orbit_extension: u32 = 0xADBE0002
+
+## A file's packed streams, decompressed into one heap buffer, and the axes
+## the splats are stored in.
+pub struct Packed:
+    pub var header: Header
+    ## The six streams back to back, `body_bytes()` long.
+    pub var bytes: u8[]
+    ## The coordinate system (coordinates.lucb) of the stored splats.
+    pub var system: u32
+
+    ## A Packed for `header` with its streams zeroed (the caller fills them).
+    pub static func allocate(header: Header) -> Packed!:
+        let bytes = try new u8[header.body_bytes() + 1] in memory.heap
+        return Packed(header, bytes[..<header.body_bytes()], rub)
+
+    ## Stream `stream` (0..<6: positions, alphas, colors, scales, rotations, sh).
+    pub func stream(stream: usize) -> u8[]:
+        var at: usize = 0
+        for before in 0..<stream: at += self.header.stream_bytes(before)
+        return self.bytes[at..<at + self.header.stream_bytes(stream)]
+
+    pub func close():
+        free(u8[](self.bytes.data, self.bytes.length + 1)) in memory.heap
+
+## The packed streams of the SPZ file `data`.
+pub func read_container(data: const u8[], warnings: Warnings*) -> Packed!:
+    if data.length >= 2 and data[0] == 0x1f and data[1] == 0x8b: return try read_gzip(data, warnings)
+    if data.length >= 4 and read_u32(data, 0) == magic: return try read_streams(data, warnings)
+    error(errors.invalid, "not an SPZ file (neither gzip nor an NGSP header)")
+
+## Versions 1-3: the gzip stream's header, streams and trailing extensions.
+func read_gzip(data: const u8[], warnings: Warnings*) -> Packed!:
+    # A decompressed SPZ is at most about 1024 times its file (the header's check).
+    var most = data.length * 1024 + 65536
+    if most > 0x400000000: most = 0x400000000
+    let plain = gzip.decode(data, most) catch failure:
+        if failure.code == memory.exhausted: error(failure.code, failure.message)
+        error(errors.invalid, "the SPZ's gzip stream is damaged or too large")
+    defer free(plain) in memory.heap
+    let header = try read_legacy_header(plain)
+    var packed = try Packed.allocate(header)
+    errdefer packed.close()
+    let end = legacy_header_bytes + header.body_bytes()
+    memory.copy(packed.bytes, plain[legacy_header_bytes..<end], header.body_bytes())
+    if header.flags & extensions_flag != 0: packed.system = try read_extensions(plain[end..], warnings)
+    return packed
+
+## Version 4: the table of contents and each stream, decompressed in parallel
+## straight into its place.
+func read_streams(data: const u8[], warnings: Warnings*) -> Packed!:
+    let header = try read_header(data)
+    var packed = try Packed.allocate(header)
+    errdefer packed.close()
+    var work = StreamWork(data, &packed, try new usize[header.streams * 2 + 1] in memory.heap)
+    defer free(work.spans) in memory.heap
+    # The streams follow the table back to back and end at the file's end.
+    var at = header.table + header.streams * 16
+    for stream in 0..<header.streams:
+        let entry = header.table + stream * 16
+        let compressed = read_u64(data, entry)
+        let size = read_u64(data, entry + 8)
+        if size != (u64)header.stream_bytes(stream): error(errors.invalid, "an SPZ stream's size does not match the header")
+        if compressed > (u64)(data.length - at): error(errors.invalid, "an SPZ stream runs past the end of the file")
+        work.spans[stream * 2] = at
+        work.spans[stream * 2 + 1] = (usize)compressed
+        at += (usize)compressed
+    if at != data.length: error(errors.invalid, "bytes after the SPZ's streams")
+    try parallel.for_each(header.streams, (void*)&work, decompress_stream)
+    if header.flags & extensions_flag != 0: packed.system = try read_extensions(data[header_bytes..<header.table], warnings)
+    return packed
+
+struct StreamWork:
+    let data: const u8[]
+    let packed: Packed*
+    ## Each stream's compressed start and length.
+    let spans: usize[]
+
+func decompress_stream(context: void*, stream: usize, worker: usize) -> !:
+    _ = worker
+    let work = (StreamWork*)context
+    let at = work.spans[stream * 2]
+    let source = work.data[at..<at + work.spans[stream * 2 + 1]]
+    let target = work.packed.stream(stream)
+    let made = zstd.decode_into(source, target) catch failure:
+        if failure.code == memory.exhausted: error(failure.code, failure.message)
+        error(errors.invalid, "an SPZ stream's zstd data is damaged")
+    if made != target.length: error(errors.invalid, "an SPZ stream is shorter than the header says")
+
+## The coordinate system the extension records in `records` name (RUB
+## without one); unknown records are skipped with a warning.
+func read_extensions(records: const u8[], warnings: Warnings*) -> u32!:
+    var system = rub
+    var at: usize = 0
+    while records.length - at >= 8:
+        let kind = read_u32(records, at)
+        let length = (usize)read_u32(records, at + 4)
+        at += 8
+        if length > records.length - at: error(errors.invalid, "an SPZ extension record runs past its block")
+        if kind == coordinate_extension and length >= 4:
+            let named = read_u32(records, at)
+            if named > system_count: error(errors.invalid, "an SPZ coordinate system extension names no system")
+            if named != 0: system = named
+        elif kind == orbit_extension:
+            try warnings.add("The SPZ's safe orbit camera extension was not read")
+        else:
+            try warnings.add("An unknown SPZ extension record was skipped")
+        at += length
+    return system
+
+# mark: Writing
+
+## The file bytes of `packed` (on memory.heap; the caller frees them):
+## version 4 as zstd streams at `level`, compressed in parallel, or versions
+## 1-3 as one gzip stream. No extension records are written.
+pub func write_container(packed: const Packed*, level: i32) -> u8[]!:
+    if packed.header.version < 4: return try write_gzip(packed)
+    let header = packed.header
+    let streams: usize = 6 if header.degree > 0 else 5
+    var work = CompressWork(packed, level, try new (u8[])[streams] in memory.heap)
+    defer:
+        for made in work.chunks:
+            if made.length > 0: free(made) in memory.heap
+        free(work.chunks) in memory.heap
+    for stream in 0..<streams: work.chunks[stream] = u8[]((u8*)0, 0)
+    try parallel.for_each(streams, (void*)&work, compress_stream)
+    let table = header_bytes
+    var total = table + streams * 16
+    for made in work.chunks: total += made.length
+    let out = try new u8[total] in memory.heap
+    var written = header
+    written.streams = streams
+    write_common(out, &written)
+    out[15] = (u8)streams
+    write_u32(out, 16, (u32)table)
+    var at = table + streams * 16
+    for stream in 0..<streams:
+        write_u64(out, table + stream * 16, (u64)work.chunks[stream].length)
+        write_u64(out, table + stream * 16 + 8, (u64)header.stream_bytes(stream))
+        memory.copy(out[at..<at + work.chunks[stream].length], work.chunks[stream], work.chunks[stream].length)
+        at += work.chunks[stream].length
+    return out
+
+struct CompressWork:
+    let packed: const Packed*
+    let level: i32
+    let chunks: (u8[])[]
+
+func compress_stream(context: void*, stream: usize, worker: usize) -> !:
+    _ = worker
+    let work = (CompressWork*)context
+    let source = ((Packed*)work.packed).stream(stream)
+    work.chunks[stream] = try zstd.encode(source, work.level)
+
+## Versions 1-3: the header and streams in one gzip stream.
+func write_gzip(packed: const Packed*) -> u8[]!:
+    let plain = try new u8[legacy_header_bytes + packed.bytes.length] in memory.heap
+    defer free(plain) in memory.heap
+    write_common(plain, &packed.header)
+    memory.copy(plain[legacy_header_bytes..], packed.bytes, packed.bytes.length)
+    return try gzip.encode(plain)

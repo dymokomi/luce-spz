@@ -1,0 +1,23 @@
+#prisma 4.0
+def package "luce_spz_tests" {
+    str source = "."
+    def dependency "luce-spz" {
+        str path = "../.."
+    }
+    def dependency "luce-ply" {
+        str owner = "dymokomi"
+        str path = "../../../luce-ply"
+    }
+    def dependency "luce-geocore" {
+        str owner = "dymokomi"
+        str path = "../../../luce-geocore"
+    }
+    def dependency "luce-compress" {
+        str owner = "dymokomi"
+        str path = "../../../luce-compress"
+    }
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str path = "../../../luce-std"
+    }
+}

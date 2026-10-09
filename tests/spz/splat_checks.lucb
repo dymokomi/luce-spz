@@ -1,0 +1,82 @@
+## `.splat` round trips, the editor's path (decode, Bake GSplats, encode) giving
+## a file's streams back, and timings on a million splats.
+import memory
+import interop
+from luce_std import clock
+from luce_geocore.kernel import GeometrySet, dispose_set, find_set_verb, run_set_verb
+from luce_spz.kernel import Warnings, EncodeOptions, encode, decode, encode_splat, decode_splat, read_file
+from support import expect, value, position, seeded_cloud, packed_of, same_packed, near
+import support
+
+## A seeded cloud through `.splat` and back: the bytes again, the values
+## within a byte's step.
+pub func splat_round_trip() -> !:
+    let source = try seeded_cloud(300, 0, 11)
+    defer dispose_set(source)
+    var warnings = Warnings()
+    defer warnings.close()
+    let first = try encode_splat(source, &warnings)
+    defer free(first) in memory.heap
+    expect(first.length == 300 * 32, "32 bytes a splat")
+    let decoded = try decode_splat(first)
+    defer dispose_set(decoded)
+    let second = try encode_splat(decoded, &warnings)
+    defer free(second) in memory.heap
+    for at in 0..<first.length: expect(first[at] == second[at], "a .splat file read and written gives its bytes back")
+    for at in 0..<(usize)300:
+        let a = position(source, at)
+        let b = position(decoded, at)
+        expect(a.x == b.x and a.y == b.y and a.z == b.z, "positions exactly")
+        expect(near(value(source, "scale_1", at), value(decoded, "scale_1", at), 1.0e-5), "log scales through linear f32")
+        expect(near(value(source, "f_dc_2", at), value(decoded, "f_dc_2", at), 0.5 / (0.28209479 * 255.0) + 1.0e-5), "colors to half a byte")
+    expect(fails_splat(first[..<31]), "a .splat file is whole records")
+    print("ok    .splat: bytes round trip, values within a byte")
+
+func fails_splat(data: const u8[]) -> bool:
+    let made = decode_splat(data) catch failure: return true
+    dispose_set(made)
+    return false
+
+## The editor's path: a reference file decoded, baked (Y down, as luced-3d's
+## File node does), and encoded gives the file's streams again.
+pub func baked_round_trip() -> !:
+    var file = try read_file("../fixtures/reference3_v4.spz")
+    defer file.release()
+    var warnings = Warnings()
+    defer warnings.close()
+    let raw = try decode(file.value, &warnings)
+    defer dispose_set(raw)
+    let verb = find_set_verb("Bake GSplats") else trap("Bake GSplats is missing")
+    let numbers: f64[7] = [0.0, 0.0, 3.0, 1.0, 0.05, 1.0, 0.0]
+    var output = try run_set_verb(&verb, raw, none, "", 0, numbers)
+    let baked = output.set else trap("Bake made no set")
+    output.set = none
+    defer dispose_set(baked)
+    var options = EncodeOptions()
+    let bytes = try encode(baked, &options, &warnings)
+    defer free(bytes) in memory.heap
+    var again = try packed_of(bytes)
+    defer again.close()
+    var theirs = try packed_of(file.value)
+    defer theirs.close()
+    expect(same_packed(&again, &theirs), "decode, Bake GSplats and encode give the file's streams back")
+    print("ok    decoded, baked (Y down) and encoded: the same streams")
+
+## A million degree-3 splats encoded (version 4) and decoded, timed.
+pub func timings() -> !:
+    let count: usize = 1000000
+    let source = try seeded_cloud(count, 15, 3)
+    defer dispose_set(source)
+    var warnings = Warnings()
+    defer warnings.close()
+    var options = EncodeOptions()
+    var started = clock.timestamp()
+    let bytes = try encode(source, &options, &warnings)
+    defer free(bytes) in memory.heap
+    let encoding = (clock.timestamp() - started) * 1000.0
+    started = clock.timestamp()
+    let decoded = try decode(bytes, &warnings)
+    defer dispose_set(decoded)
+    let decoding = (clock.timestamp() - started) * 1000.0
+    expect(support.cloud_of(decoded).count() == count, "a million splats back")
+    print(f"ok    1M degree-3 splats: encode {encoding} ms ({bytes.length} bytes), decode {decoding} ms")

@@ -1,0 +1,216 @@
+## A splat cloud as an SPZ file. The cloud is read in a 3DGS PLY's raw names
+## (reader.lucb); a cloud in luce-geocore's conventions (`orient`, `scale`,
+## `opacity`, `Cd`, `sh`) is unbaked to them first. Raw names are taken to be
+## in a PLY's RDF axes, as unbaking a cloud baked from a Y-down file gives
+## them; a baked cloud without `gsplat_up_axis` is already Y-up, SPZ's RUB.
+## The splats are quantized as Niantic's packer quantizes them (in f32, the
+## same rounding), in parallel blocks, and written as version 4 (zstd
+## streams), or 3 or 2 (gzip) on request.
+import memory
+from luce_std import math32, parallel
+from luce_geocore.kernel import Float3, AttributeStore, Attribute, Domain, DataType, GeometrySet, set_cloud, set_splats, set_detail, unbaked_set, dispose_set, cloud_positions, cloud_origin, cloud_store
+from luce_geocore.splats import Floats, point_floats, up_axis_name, y_down_text
+from format import Header, sh_dimension, max_kept_degree, latest_version, antialiased_flag
+from container import Packed, write_container
+from coordinates import Converter, rdf, rub
+from reader import raw_names, antialiased_name
+from warnings import Warnings
+import errors
+
+## How to write.
+pub struct EncodeOptions:
+    ## 2, 3 or 4.
+    pub var version: u32 = 4
+    ## Fractional bits of the 24-bit positions; fewer when the cloud is too
+    ## large for them (with a warning).
+    pub var fractional_bits: u32 = 12
+    ## Bits kept of band 1's SH bytes, and of bands 2 and 3's (1 to 8): fewer
+    ## bits compress better.
+    pub var sh1_bits: u32 = 5
+    pub var rest_bits: u32 = 4
+    ## The zstd level of version 4's streams.
+    pub var level: i32 = 12
+
+## The SPZ file of `geometry`'s splats, on memory.heap (the caller frees it).
+pub func encode(geometry: const GeometrySet*, options: const EncodeOptions*, warnings: Warnings*) -> u8[]!:
+    if options.version < 2 or options.version > latest_version: error(errors.unsupported, "SPZ versions 2 to 4 are written")
+    if options.sh1_bits < 1 or options.sh1_bits > 8 or options.rest_bits < 1 or options.rest_bits > 8:
+        error(errors.invalid, "SH bits are 1 to 8")
+    # A baked cloud goes back to the raw names; a Y-down one to RDF axes.
+    var unbaked: GeometrySet*? = none
+    defer:
+        if let made = unbaked: dispose_set(made)
+    var source: const GeometrySet* = geometry
+    var system = rdf
+    if set_splats(geometry) != none:
+        let made = try unbaked_set(geometry)
+        unbaked = made
+        source = made
+        let detail = set_detail(geometry)
+        let up = detail.find(up_axis_name, Domain.detail)
+        if up < 0 or detail.entry((usize)up).text_at(0) != y_down_text: system = rub
+    let cloud = set_cloud(source) else error(errors.invalid, "the geometry has no point cloud to write as splats")
+    var work = try PackWork.of(cloud_store(cloud), cloud.count(), options)
+    work.positions = cloud_positions(cloud)
+    work.origin = [cloud_origin(cloud).x, cloud_origin(cloud).y, cloud_origin(cloud).z]
+    work.converter = Converter.between(system, rub)
+    var header: Header
+    header.version = options.version
+    header.splats = cloud.count()
+    header.degree = work.degree
+    header.fractional_bits = try fitting_bits(&work, options.fractional_bits, warnings)
+    header.flags = antialiased_flag if antialiased(set_detail(geometry)) else 0
+    if header.splats == 0: error(errors.invalid, "an SPZ holds at least one splat")
+    if header.splats > 0x7FFFFFFF: error(errors.limit, "an SPZ holds at most 2³¹ - 1 splats")
+    var packed = try Packed.allocate(header)
+    defer packed.close()
+    work.packed = &packed
+    try parallel.for_each_range(header.splats, 4096, (void*)&work, pack_range)
+    return try write_container(&packed, options.level)
+
+## Whether the detail attributes set the antialiased flag.
+func antialiased(detail: const AttributeStore*) -> bool:
+    let index = detail.find(antialiased_name, Domain.detail)
+    if index < 0: return false
+    let entry = detail.entry((usize)index)
+    return entry.kind != DataType.text and entry.number(0, 0) != 0.0
+
+## The fractional bits to write: `wanted`, or fewer until every converted
+## position fits 24 signed bits.
+func fitting_bits(work: const PackWork*, wanted: u32, warnings: Warnings*) -> u32!:
+    var largest: f32 = 0.0
+    for at in 0..<work.positions.length:
+        let p = work.position(at)
+        for k in 0..<(usize)3:
+            let size = p[k] if p[k] >= 0.0 else -p[k]
+            if size > largest or not (size == size): largest = size
+    if not (largest == largest) or largest > 8.0e6: error(errors.limit, "positions past ±8388607 do not fit an SPZ")
+    var bits = wanted if wanted < 24 else 23
+    while bits > 0 and math32.round(largest * (f32)((u32)1 << bits)) > 8388607.0: bits -= 1
+    if bits < wanted: try warnings.add("Positions were written with fewer fractional bits: the cloud is too large for the ones asked")
+    return bits
+
+## The columns packed and where they go.
+struct PackWork:
+    var packed: Packed*?
+    var converter: Converter
+    var positions: const Float3[]
+    var origin: f64[3]
+    var columns: Floats[11]
+    var rest: const Attribute*?
+    var degree: usize
+    var sh1_bucket: i32
+    var rest_bucket: i32
+
+    static func of(store: const AttributeStore*, count: usize, options: const EncodeOptions*) -> PackWork!:
+        var work: PackWork
+        for index in 0..<(usize)11:
+            work.columns[index] = point_floats(store, raw_names[index], 1) else error(errors.invalid, "the cloud has no 3DGS splat attributes (f_dc_0..2, opacity, scale_0..2, rot_0..3)")
+        let found = store.find("f_rest", Domain.point)
+        if found >= 0:
+            let entry = store.entry((usize)found)
+            if not entry.is_ragged() or entry.width != 3 or entry.kind != DataType.float32: error(errors.invalid, "f_rest is not an array of RGB items")
+            var most: usize = 0
+            for element in 0..<count:
+                if entry.item_count(element) > most: most = entry.item_count(element)
+            work.rest = entry
+            work.degree = 3 if most >= 15 else (2 if most >= 8 else (1 if most >= 3 else 0))
+        work.sh1_bucket = (i32)1 << (8 - options.sh1_bits)
+        work.rest_bucket = (i32)1 << (8 - options.rest_bits)
+        return work
+
+    ## Splat `at`'s position in SPZ's axes, in f32 as the reference holds it.
+    func position(at: usize) -> f32[3]:
+        let offset = self.positions[at]
+        var p: f32[3] = [(f32)(self.origin[0] + (f64)offset.x), (f32)(self.origin[1] + (f64)offset.y), (f32)(self.origin[2] + (f64)offset.z)]
+        self.converter.position(p)
+        return p
+
+func pack_range(context: void*, first: usize, end: usize, worker: usize):
+    _ = worker
+    let work = (PackWork*)context
+    let packed = work.packed else return
+    let header = packed.header
+    let positions = packed.stream(0)
+    let alphas = packed.stream(1)
+    let colors = packed.stream(2)
+    let scales = packed.stream(3)
+    let rotations = packed.stream(4)
+    let sh = packed.stream(5)
+    let scale = (f32)((u32)1 << header.fractional_bits)
+    let items = sh_dimension(work.degree)
+    for at in first..<end:
+        let p = work.position(at)
+        for k in 0..<(usize)3:
+            let fixed = (i32)math32.round(p[k] * scale)
+            # 24-bit two's complement (fitting_bits keeps it in range).
+            let bits = (u32)(fixed + 0x1000000) if fixed < 0 else (u32)fixed
+            for byte in 0..<(usize)3: positions[(at * 3 + k) * 3 + byte] = (u8)(bits >> (u32)(byte * 8))
+        let c = work.columns
+        for k in 0..<(usize)3:
+            colors[at * 3 + k] = to_byte((f32)c[k].at(at, 0) * (0.15 * 255.0) + 0.5 * 255.0)
+            scales[at * 3 + k] = to_byte(((f32)c[4 + k].at(at, 0) + 10.0) * 16.0)
+        alphas[at] = to_byte(sigmoid((f32)c[3].at(at, 0)) * 255.0)
+        # x, y, z, w from the PLY's w, x, y, z; normalized, then converted.
+        var q: f32[4] = [(f32)c[8].at(at, 0), (f32)c[9].at(at, 0), (f32)c[10].at(at, 0), (f32)c[7].at(at, 0)]
+        let length = math32.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
+        if length > 0.0:
+            for k in 0..<(usize)4: q[k] = q[k] / length
+        else: q = [0.0, 0.0, 0.0, 1.0]
+        work.converter.rotation(q)
+        if header.smallest_three(): pack_smallest_three(q, rotations[at * 4..<at * 4 + 4])
+        else: pack_first_three(q, rotations[at * 3..<at * 3 + 3])
+        if items == 0: continue
+        var values: f32[45]
+        if let rest = work.rest:
+            let held = rest.item_count(at)
+            for item in 0..<(held if held < items else items):
+                for channel in 0..<(usize)3: values[item * 3 + channel] = (f32)rest.item(at, item, channel)
+        work.converter.sh_items(values, items)
+        for item in 0..<items:
+            let bucket = work.sh1_bucket if item < 3 else work.rest_bucket
+            for channel in 0..<(usize)3: sh[(at * items + item) * 3 + channel] = quantized_sh(values[item * 3 + channel], bucket)
+
+## `x` rounded (halves away from zero) and clamped to a byte.
+func to_byte(x: f32) -> u8:
+    let rounded = math32.round(x)
+    if not (rounded > 0.0): return 0
+    if rounded > 255.0: return 255
+    return (u8)rounded
+
+func sigmoid(x: f32) -> f32:
+    return 1.0 / (1.0 + math32.exp(-x))
+
+## An SH coefficient as a byte: x · 128 + 128, then the nearest multiple of
+## `bucket` (so 0 stays 128), clamped.
+func quantized_sh(x: f32, bucket: i32) -> u8:
+    var q = (i32)math32.round(x * 128.0) + 128
+    q = (q + bucket // 2) // bucket * bucket
+    if q < 0: return 0
+    if q > 255: return 255
+    return (u8)q
+
+## Versions 3 and 4: the largest component made positive (q and -q are the
+## same rotation) and left out; the others as sign and 9-bit magnitude, as the
+## reference packs them (which tests `< 0`, so it differs only for a -0).
+func pack_smallest_three(q: const f32[], out: u8[]):
+    var largest: usize = 0
+    for k in 1..<(usize)4:
+        if math32.abs(q[k]) > math32.abs(q[largest]): largest = k
+    let negate = q[largest] < 0.0
+    var packed = (u32)largest
+    for k in 0..<(usize)4:
+        if k == largest: continue
+        # The sign bit, not `< 0`: a decoded -0 (a tiny negative stored as
+        # magnitude 0) keeps its bit, so decoding and encoding is exact.
+        let negative = (q[k].bits() >> 31 != 0) != negate
+        let magnitude = (u32)(511.0 * (math32.abs(q[k]) / sqrt_half) + 0.5)
+        packed = (packed << 10) | ((1 if negative else 0) << 9) | magnitude
+    for byte in 0..<(usize)4: out[byte] = (u8)(packed >> (u32)(byte * 8))
+
+let sqrt_half: f32 = 0.70710678118654752
+
+## Version 2: x, y and z of the quaternion with w ≥ 0, as bytes over -1..1.
+func pack_first_three(q: const f32[], out: u8[]):
+    let sign: f32 = -127.5 if q[3] < 0.0 else 127.5
+    for k in 0..<(usize)3: out[k] = to_byte(q[k] * sign + 127.5)

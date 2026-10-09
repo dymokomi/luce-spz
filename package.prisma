@@ -1,0 +1,22 @@
+#prisma 4.0
+def package "luce-spz" {
+    str owner = "dymokomi"
+    str version = "0.1.0"
+    str kind = "package"
+    str language = "luce-base"
+    str readme = "README.md"
+    str description = "Compact Gaussian splat files in Luce Base: Niantic SPZ (v1-v4 read, v4 written with zstd) and antimatter15 .splat, as luce-geocore point clouds in 3DGS PLY names, decoded and encoded in parallel."
+    str[] public = ["spz", "kernel"]
+    def dependency "luce-geocore" {
+        str owner = "dymokomi"
+        str path = "../luce-geocore"
+    }
+    def dependency "luce-compress" {
+        str owner = "dymokomi"
+        str path = "../luce-compress"
+    }
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str path = "../luce-std"
+    }
+}

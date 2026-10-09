@@ -1,0 +1,41 @@
+## The luce_spz.kernel export: SPZ and `.splat` for Base callers and tests,
+## over bytes and raw sets. Luce code uses `spz` instead.
+import reader
+import writer
+import splat_file
+import container
+import coordinates
+import format
+import warnings
+import source
+import errors
+
+## What a read or write left out, line by line.
+pub type Warnings = warnings.Warnings
+## An SPZ file's bytes as a GeometrySet in the raw 3DGS names (the caller
+## disposes of it).
+pub let decode = reader.decode
+## How `encode` writes: version, fractional bits, SH bits, zstd level.
+pub type EncodeOptions = writer.EncodeOptions
+## A splat cloud as SPZ bytes on memory.heap (the caller frees them).
+pub let encode = writer.encode
+## A `.splat` file's bytes as a GeometrySet, and back.
+pub let decode_splat = splat_file.decode_splat
+pub let encode_splat = splat_file.encode_splat
+## A file's packed streams, and the bytes of packed streams.
+pub type Packed = container.Packed
+pub let read_container = container.read_container
+pub let write_container = container.write_container
+## A conversion between SPZ's coordinate systems (1 to 16; RUB is 4, RDF 6).
+pub type Converter = coordinates.Converter
+## The SPZ header's fields, and its parsers.
+pub type Header = format.Header
+pub let read_header = format.read_header
+pub let read_legacy_header = format.read_legacy_header
+## A file's bytes, mapped, and an atomic write.
+pub let read_file = source.read
+pub let write_file = source.write
+## The bytes are malformed or truncated; a version not handled; a size past the format's.
+pub let invalid: ErrorCode = errors.invalid
+pub let unsupported: ErrorCode = errors.unsupported
+pub let limit: ErrorCode = errors.limit

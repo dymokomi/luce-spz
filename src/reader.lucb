@@ -1,0 +1,185 @@
+## An SPZ file's splats as a GeometrySet in a 3DGS PLY's raw names, the form
+## luce-ply reads a PLY into: positions, `f_dc_0..2`, `opacity` (a logit),
+## `scale_0..2` (natural logs), `rot_0..3` (w, x, y, z) as f32 point
+## attributes, and the SH as one array attribute `f_rest` of RGB items,
+## coefficient-major. Like a PLY, the splats are in RDF axes (x right, y down,
+## z front): the stored axes (RUB unless an extension says otherwise) are
+## converted as Niantic's loader converts them for a PLY. luce-geocore's Bake
+## GSplats then turns the names into its conventions exactly as it does a
+## PLY's. Decoding follows the reference loader's arithmetic in f32, except
+## that alpha bytes 0 and 255 decode to finite logits (the reference's are
+## infinite), which encode back to the same bytes.
+##
+## The splats unpack in parallel blocks on luce-std's pool. SH band 4 (a
+## version 4 file may hold it) is dropped with a warning.
+import memory
+from luce_std import math32, parallel
+from luce_geocore.geocore import Vector3
+from luce_geocore.core.shared import Column
+from luce_geocore.kernel import Float3, Attribute, AttributeStore, Domain, DataType, GeometrySet, empty_set, dispose_set, points_component, cloud_assembled, set_put_detail
+from format import Header, sh_dimension, max_kept_degree, antialiased_flag
+from container import Packed, read_container
+from coordinates import Converter, rdf
+from warnings import Warnings
+import errors
+
+## The raw names, in the order of the decoded columns.
+pub let raw_names: str[11] = ["f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"]
+## The detail attribute recording the antialiased flag (1 when set).
+pub let antialiased_name: str = "gsplat_antialiased"
+
+## The SPZ file `data` as a point cloud set (the caller disposes of it).
+pub func decode(data: const u8[], warnings: Warnings*) -> GeometrySet*!:
+    var packed = try read_container(data, warnings)
+    defer packed.close()
+    if packed.header.degree > max_kept_degree: try warnings.add("SH band 4 was dropped: luce-geocore keeps bands 1 to 3")
+    return try unpacked_set(&packed)
+
+## The set of `packed`'s splats in the raw names, converted to RDF.
+pub func unpacked_set(packed: const Packed*) -> GeometrySet*!:
+    let header = packed.header
+    let count = header.splats
+    let items = sh_dimension(header.degree if header.degree < max_kept_degree else max_kept_degree)
+    var store = AttributeStore()
+    errdefer store.close()
+    var work: UnpackWork
+    work.packed = packed
+    work.items = items
+    work.converter = Converter.between(packed.system, rdf)
+    for index in 0..<(usize)11:
+        try store.put(try Attribute.create(raw_names[index], Domain.point, DataType.float32, 1, count))
+        work.columns[index] = f32[]((f32*)store.entry(index).data.span().data, count)
+    var offsets = try Column[u8].allocate((count + 1) * 4)
+    defer offsets.release()
+    var values = try Column[u8].allocate(count * items * 12)
+    defer values.release()
+    work.sh = f32[]((f32*)values.span().data, count * items * 3)
+    let bounds = offsets.span()
+    for row in 0..<count + 1: memory.write[u32]((void*)&bounds[row * 4], (u32)(row * items))
+    var positions = try Column[Float3].allocate(count)
+    defer positions.release()
+    work.positions = positions.span()
+    try parallel.for_each_range(count, 4096, (void*)&work, unpack_range)
+    if items > 0: try store.put(try Attribute.ragged("f_rest", Domain.point, DataType.float32, 3, offsets.take(), values.take()))
+    let geometry = try empty_set()
+    errdefer dispose_set(geometry)
+    # cloud_assembled takes the positions and the store, even on failure.
+    let attributes = store
+    store = AttributeStore()
+    let cloud = try cloud_assembled(positions.take(), Vector3(), attributes)
+    try geometry.put(points_component(), (void*)cloud)
+    if header.flags & antialiased_flag != 0:
+        var flag = try Attribute.create(antialiased_name, Domain.detail, DataType.int32, 1, 1)
+        i32[]((i32*)flag.data.span().data, 1)[0] = 1
+        try set_put_detail(geometry, flag)
+    return geometry
+
+## One block of splats unpacked into the columns.
+struct UnpackWork:
+    var packed: const Packed*?
+    var converter: Converter
+    var items: usize
+    var columns: (f32[])[11]
+    var sh: f32[]
+    var positions: Float3[]
+
+func unpack_range(context: void*, first: usize, end: usize, worker: usize):
+    _ = worker
+    let work = (UnpackWork*)context
+    let packed = (Packed*)(work.packed else return)
+    let header = packed.header
+    let positions = packed.stream(0)
+    let alphas = packed.stream(1)
+    let colors = packed.stream(2)
+    let scales = packed.stream(3)
+    let rotations = packed.stream(4)
+    let sh = packed.stream(5)
+    let dimension = sh_dimension(header.degree)
+    # 1 / 2^fractional_bits, exactly.
+    let step = 1.0 / (f32)((u32)1 << header.fractional_bits)
+    let half = header.half_positions()
+    let smallest = header.smallest_three()
+    let converter = &work.converter
+    for at in first..<end:
+        var p: f32[3]
+        for k in 0..<(usize)3:
+            if half:
+                let base = (at * 3 + k) * 2
+                p[k] = half_to_float((u16)positions[base] | ((u16)positions[base + 1] << 8))
+            else:
+                let base = (at * 3 + k) * 3
+                var fixed = (i32)((u32)positions[base] | ((u32)positions[base + 1] << 8) | ((u32)positions[base + 2] << 16))
+                # 24-bit two's complement.
+                if fixed >= 0x800000: fixed -= 0x1000000
+                p[k] = (f32)fixed * step
+        converter.position(p)
+        work.positions[at] = Float3(p[0], p[1], p[2])
+        var q: f32[4]
+        if smallest: smallest_three(rotations[at * 4..<at * 4 + 4], q)
+        else: first_three(rotations[at * 3..<at * 3 + 3], q)
+        converter.rotation(q)
+        # PLY order: w, x, y, z.
+        work.columns[7][at] = q[3]
+        work.columns[8][at] = q[0]
+        work.columns[9][at] = q[1]
+        work.columns[10][at] = q[2]
+        for k in 0..<(usize)3:
+            work.columns[k][at] = ((f32)colors[at * 3 + k] / 255.0 - 0.5) / 0.15
+            work.columns[4 + k][at] = (f32)scales[at * 3 + k] / 16.0 - 10.0
+        work.columns[3][at] = alpha_logit(alphas[at])
+        if work.items == 0: continue
+        let out = work.sh[at * work.items * 3..<(at + 1) * work.items * 3]
+        for item in 0..<work.items:
+            for channel in 0..<(usize)3:
+                out[item * 3 + channel] = ((f32)sh[(at * dimension + item) * 3 + channel] - 128.0) / 128.0
+        converter.sh_items(out, work.items)
+
+## The logit of an alpha byte, bytes 0 and 255 a quarter step inside so it is
+## finite (and encodes back to the same byte).
+pub func alpha_logit(byte: u8) -> f32:
+    var x = (f32)byte / 255.0
+    if byte == 0: x = 0.25 / 255.0
+    if byte == 255: x = 254.75 / 255.0
+    return math32.log(x / (1.0 - x))
+
+## Versions 3 and 4: the largest component's index in the top two bits, then
+## the other three from the last to the first, each a sign bit and a 9-bit
+## magnitude in units of √½ / 511; the largest is what makes it unit.
+pub func smallest_three(bytes: const u8[], q: f32[]):
+    var packed = (u32)bytes[0] | ((u32)bytes[1] << 8) | ((u32)bytes[2] << 16) | ((u32)bytes[3] << 24)
+    let largest = (usize)(packed >> 30)
+    var squares: f32 = 0.0
+    var index: usize = 4
+    while index > 0:
+        index -= 1
+        if index == largest: continue
+        let magnitude = packed & 511
+        let negative = (packed >> 9) & 1 != 0
+        packed = packed >> 10
+        var value = sqrt_half * (f32)magnitude / 511.0
+        if negative: value = -value
+        q[index] = value
+        squares += value * value
+    q[largest] = math32.sqrt(1.0 - squares if squares < 1.0 else 0.0)
+
+let sqrt_half: f32 = 0.70710678118654752
+
+## Versions 1 and 2: x, y and z as bytes over -1..1, w ≥ 0 what makes it unit.
+pub func first_three(bytes: const u8[], q: f32[]):
+    var squares: f32 = 0.0
+    for k in 0..<(usize)3:
+        q[k] = (f32)bytes[k] * (1.0 / 127.5) - 1.0
+        squares += q[k] * q[k]
+    q[3] = math32.sqrt(1.0 - squares if squares < 1.0 else 0.0)
+
+## An IEEE half (version 1 positions) as f32.
+pub func half_to_float(bits: u16) -> f32:
+    let sign = (u32)(bits >> 15) << 31
+    let exponent = (u32)(bits >> 10) & 31
+    let mantissa = (u32)bits & 1023
+    if exponent == 0:
+        # Zero or subnormal: mantissa · 2^-24.
+        let value = (f32)mantissa * 5.9604644775390625e-8
+        return -value if sign != 0 else value
+    if exponent == 31: return f32.bits(sign | 0x7F800000 | (mantissa << 13))
+    return f32.bits(sign | ((exponent + 112) << 23) | (mantissa << 13))

@@ -1,0 +1,142 @@
+## The headerless `.splat` format (antimatter15's WebGL viewer): 32 bytes per
+## splat, little-endian.
+##
+## | Bytes | Field |
+## |---|---|
+## | 0..11 | position, f32 × 3 |
+## | 12..23 | scale, f32 × 3, linear σ |
+## | 24..27 | RGBA bytes: RGB = (0.5 + C0 · f_dc) · 255, A = sigmoid(opacity) · 255 |
+## | 28..31 | rotation bytes, w, x, y, z as q · 128 + 128 |
+##
+## It holds no SH, and its axes are its PLY source's (RDF): no conversion. It
+## reads to the same raw names as an SPZ (reader.lucb) and writes from them,
+## unbaking a baked cloud first. Bytes are rounded and quaternions already
+## unit to the bytes' precision are not renormalized, so a file read and
+## written gives back its bytes and positions exactly and its scales within an
+## f32 ulp (they pass through a log).
+import memory
+from luce_std import math32, parallel
+from luce_geocore.geocore import Vector3
+from luce_geocore.core.shared import Column
+from luce_geocore.kernel import Float3, Attribute, AttributeStore, Domain, DataType, GeometrySet, empty_set, dispose_set, points_component, cloud_assembled, set_cloud, set_splats, unbaked_set, cloud_positions, cloud_origin, cloud_store
+from luce_geocore.splats import Floats, point_floats
+from reader import raw_names, alpha_logit
+from warnings import Warnings
+import errors
+
+let record_bytes: usize = 32
+## The SH DC basis constant, 1 / (2 √π).
+let c0: f32 = 0.28209479177387814
+
+## The `.splat` file `data` as a point cloud set (the caller disposes of it).
+pub func decode_splat(data: const u8[]) -> GeometrySet*!:
+    if data.length == 0 or data.length % record_bytes != 0: error(errors.invalid, "a .splat file is a whole number of 32-byte splats")
+    let count = data.length // record_bytes
+    var store = AttributeStore()
+    errdefer store.close()
+    var work: ReadWork
+    work.data = data
+    for index in 0..<(usize)11:
+        try store.put(try Attribute.create(raw_names[index], Domain.point, DataType.float32, 1, count))
+        work.columns[index] = f32[]((f32*)store.entry(index).data.span().data, count)
+    var positions = try Column[Float3].allocate(count)
+    defer positions.release()
+    work.positions = positions.span()
+    try parallel.for_each_range(count, 16384, (void*)&work, read_range)
+    let geometry = try empty_set()
+    errdefer dispose_set(geometry)
+    let attributes = store
+    store = AttributeStore()
+    let cloud = try cloud_assembled(positions.take(), Vector3(), attributes)
+    try geometry.put(points_component(), (void*)cloud)
+    return geometry
+
+struct ReadWork:
+    var data: const u8[]
+    var columns: (f32[])[11]
+    var positions: Float3[]
+
+func f32_at(data: const u8[], at: usize) -> f32:
+    return f32.bits((u32)data[at] | ((u32)data[at + 1] << 8) | ((u32)data[at + 2] << 16) | ((u32)data[at + 3] << 24))
+
+func read_range(context: void*, first: usize, end: usize, worker: usize):
+    _ = worker
+    let work = (ReadWork*)context
+    for at in first..<end:
+        let base = at * record_bytes
+        let d = work.data
+        work.positions[at] = Float3(f32_at(d, base), f32_at(d, base + 4), f32_at(d, base + 8))
+        for k in 0..<(usize)3:
+            work.columns[4 + k][at] = math32.log(f32_at(d, base + 12 + k * 4))
+            work.columns[k][at] = ((f32)d[base + 24 + k] / 255.0 - 0.5) / c0
+            work.columns[7 + k][at] = ((f32)d[base + 28 + k] - 128.0) / 128.0
+        work.columns[10][at] = ((f32)d[base + 31] - 128.0) / 128.0
+        work.columns[3][at] = alpha_logit(d[base + 27])
+
+## The `.splat` file of `geometry`'s splats, on memory.heap (the caller frees
+## it). Their SH, which the format cannot hold, are dropped with a warning.
+pub func encode_splat(geometry: const GeometrySet*, warnings: Warnings*) -> u8[]!:
+    var unbaked: GeometrySet*? = none
+    defer:
+        if let made = unbaked: dispose_set(made)
+    var source: const GeometrySet* = geometry
+    if set_splats(geometry) != none:
+        let made = try unbaked_set(geometry)
+        unbaked = made
+        source = made
+    let cloud = set_cloud(source) else error(errors.invalid, "the geometry has no point cloud to write as splats")
+    let store = cloud_store(cloud)
+    var work: WriteWork
+    for index in 0..<(usize)11:
+        work.columns[index] = point_floats(store, raw_names[index], 1) else error(errors.invalid, "the cloud has no 3DGS splat attributes (f_dc_0..2, opacity, scale_0..2, rot_0..3)")
+    if store.find("f_rest", Domain.point) >= 0: try warnings.add("The splats' SH were left out: .splat holds only their base color")
+    let count = cloud.count()
+    if count == 0: error(errors.invalid, "a .splat file holds at least one splat")
+    work.positions = cloud_positions(cloud)
+    let origin = cloud_origin(cloud)
+    work.origin = [origin.x, origin.y, origin.z]
+    let out = try new u8[count * record_bytes] in memory.heap
+    errdefer free(out) in memory.heap
+    work.out = out
+    try parallel.for_each_range(count, 16384, (void*)&work, write_range)
+    return out
+
+struct WriteWork:
+    var columns: Floats[11]
+    var positions: const Float3[]
+    var origin: f64[3]
+    var out: u8[]
+
+func put_f32(out: u8[], at: usize, value: f32):
+    let bits = value.bits()
+    for k in 0..<(usize)4: out[at + k] = (u8)(bits >> (u32)(k * 8))
+
+## `x` rounded and clamped to a byte.
+func byte_of(x: f32) -> u8:
+    let rounded = math32.round(x)
+    if not (rounded > 0.0): return 0
+    if rounded > 255.0: return 255
+    return (u8)rounded
+
+func write_range(context: void*, first: usize, end: usize, worker: usize):
+    _ = worker
+    let work = (WriteWork*)context
+    let c = work.columns
+    for at in first..<end:
+        let base = at * record_bytes
+        let p = work.positions[at]
+        put_f32(work.out, base, (f32)(work.origin[0] + (f64)p.x))
+        put_f32(work.out, base + 4, (f32)(work.origin[1] + (f64)p.y))
+        put_f32(work.out, base + 8, (f32)(work.origin[2] + (f64)p.z))
+        for k in 0..<(usize)3:
+            put_f32(work.out, base + 12 + k * 4, math32.exp((f32)c[4 + k].at(at, 0)))
+            work.out[base + 24 + k] = byte_of((0.5 + c0 * (f32)c[k].at(at, 0)) * 255.0)
+        work.out[base + 27] = byte_of(255.0 / (1.0 + math32.exp(-(f32)c[3].at(at, 0))))
+        # w, x, y, z.
+        var q: f32[4] = [(f32)c[7].at(at, 0), (f32)c[8].at(at, 0), (f32)c[9].at(at, 0), (f32)c[10].at(at, 0)]
+        let length = math32.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
+        # Bytes hold about 1/128: a quaternion that close to unit stays as it is.
+        if not (length > 0.0): q = [1.0, 0.0, 0.0, 0.0]
+        elif math32.abs(length - 1.0) > 1.0 / 64.0:
+            for k in 0..<(usize)4: q[k] = q[k] / length
+        for k in 0..<(usize)4: work.out[base + 28 + k] = byte_of(q[k] * 128.0 + 128.0)

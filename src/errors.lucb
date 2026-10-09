@@ -1,0 +1,9 @@
+## luce-spz's error codes, one per kind of failure. Messages say what went
+## wrong and, where it helps, which stream or field.
+
+## The bytes are not an SPZ (or .splat) file, or are malformed or truncated.
+pub let invalid: ErrorCode = ErrorCode.package(830)
+## A valid file this package does not read or write (a version past 4).
+pub let unsupported: ErrorCode = ErrorCode.package(831)
+## A size past what the format or a GeometrySet can hold.
+pub let limit: ErrorCode = ErrorCode.package(832)

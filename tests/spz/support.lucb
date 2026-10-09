@@ -1,0 +1,126 @@
+## Shared helpers for the checks: fixture files, raw clouds and their values,
+## and packed-stream comparison.
+import memory
+import strings
+from luce_std import math
+from luce_geocore.geocore import Vector3
+from luce_geocore.core.shared import Column
+from luce_geocore.kernel import GeometrySet, Attribute, AttributeStore, Domain, DataType, Float3, PointCloud, dispose_set, empty_set, points_component, cloud_assembled, set_cloud, cloud_store, cloud_positions, cloud_origin
+from luce_geocore.splats import Floats, point_floats
+from luce_spz.kernel import Warnings, Packed, read_container, read_file
+from luce_ply import kernel as ply
+
+pub let raw_names: str[11] = ["f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"]
+
+pub func expect(condition: bool, what: str):
+    if not condition:
+        print(f"FAIL  {what}")
+        trap("luce-spz checks")
+
+## The fixture PLY `name` (tests/fixtures) as a raw splat cloud set.
+pub func fixture_cloud(name: str) -> GeometrySet*!:
+    var room: u8[128]
+    var data = try ply.read_file(try strings.format(room, f"../fixtures/{name}"))
+    defer data.release()
+    var warnings = ply.Warnings()
+    defer warnings.close()
+    return try ply.decode(data.value, &warnings)
+
+## The fixture file `name`'s packed streams.
+pub func fixture_packed(name: str) -> Packed!:
+    var room: u8[128]
+    var data = try read_file(try strings.format(room, f"../fixtures/{name}"))
+    defer data.release()
+    var warnings = Warnings()
+    defer warnings.close()
+    return try read_container(data.value, &warnings)
+
+## The packed streams of SPZ bytes.
+pub func packed_of(bytes: const u8[]) -> Packed!:
+    var warnings = Warnings()
+    defer warnings.close()
+    return try read_container(bytes, &warnings)
+
+## Whether two packed files hold the same header fields and streams.
+pub func same_packed(a: const Packed*, b: const Packed*) -> bool:
+    if a.header.splats != b.header.splats or a.header.degree != b.header.degree or a.header.fractional_bits != b.header.fractional_bits or a.header.flags != b.header.flags: return false
+    if a.bytes.length != b.bytes.length: return false
+    for at in 0..<a.bytes.length:
+        if a.bytes[at] != b.bytes[at]: return false
+    return true
+
+## The cloud of a set (trap without one).
+pub func cloud_of(set: const GeometrySet*) -> const PointCloud*:
+    return set_cloud(set) else trap("the set has no point cloud")
+
+## Raw value `name` of splat `at`.
+pub func value(set: const GeometrySet*, name: str, at: usize) -> f64:
+    let floats = point_floats(cloud_store(cloud_of(set)), name, 1) else trap("a raw splat attribute is missing")
+    return floats.at(at, 0)
+
+## Splat `at`'s position (with the cloud's origin).
+pub func position(set: const GeometrySet*, at: usize) -> Vector3:
+    let cloud = cloud_of(set)
+    let p = cloud_positions(cloud)[at]
+    let origin = cloud_origin(cloud)
+    return Vector3(origin.x + (f64)p.x, origin.y + (f64)p.y, origin.z + (f64)p.z)
+
+## Item `item`, channel `channel` of splat `at`'s `f_rest` (0 past its items).
+pub func rest(set: const GeometrySet*, at: usize, item: usize, channel: usize) -> f64:
+    let store = cloud_store(cloud_of(set))
+    let index = store.find("f_rest", Domain.point)
+    if index < 0: return 0.0
+    let entry = store.entry((usize)index)
+    return entry.item(at, item, channel) if item < entry.item_count(at) else 0.0
+
+## The items per splat of a set's `f_rest` (0 without it).
+pub func rest_items(set: const GeometrySet*) -> usize:
+    let store = cloud_store(cloud_of(set))
+    let index = store.find("f_rest", Domain.point)
+    if index < 0: return 0
+    return store.entry((usize)index).item_count(0)
+
+## A seeded raw splat cloud of `count` splats with `items` SH items each, the
+## values in the fixture generator's ranges.
+pub func seeded_cloud(count: usize, items: usize, seed: u64) -> GeometrySet*!:
+    var state = seed
+    var store = AttributeStore()
+    errdefer store.close()
+    let low: f64[11] = [-1.5, -1.5, -1.5, -6.0, -7.0, -7.0, -7.0, -1.0, -1.0, -1.0, -1.0]
+    let high: f64[11] = [1.5, 1.5, 1.5, 6.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0]
+    for index in 0..<(usize)11:
+        try store.put(try Attribute.create(raw_names[index], Domain.point, DataType.float32, 1, count))
+        let values = f32[]((f32*)store.entry(index).data.span().data, count)
+        for at in 0..<count: values[at] = (f32)(low[index] + (high[index] - low[index]) * draw(&state))
+    if items > 0:
+        var offsets = try Column[u8].allocate((count + 1) * 4)
+        defer offsets.release()
+        let bounds = offsets.span()
+        for row in 0..<count + 1: memory.write[u32]((void*)&bounds[row * 4], (u32)(row * items))
+        var values = try Column[u8].allocate(count * items * 12)
+        defer values.release()
+        let floats = f32[]((f32*)values.span().data, count * items * 3)
+        for at in 0..<floats.length: floats[at] = (f32)(-0.6 + 1.2 * draw(&state))
+        try store.put(try Attribute.ragged("f_rest", Domain.point, DataType.float32, 3, offsets.take(), values.take()))
+    var positions = try Column[Float3].allocate(count)
+    defer positions.release()
+    for at in 0..<count: positions.span()[at] = Float3((f32)(6.0 * draw(&state) - 3.0), (f32)(6.0 * draw(&state) - 3.0), (f32)(6.0 * draw(&state) - 3.0))
+    let geometry = try empty_set()
+    errdefer dispose_set(geometry)
+    let attributes = store
+    store = AttributeStore()
+    try geometry.put(points_component(), (void*)(try cloud_assembled(positions.take(), Vector3(), attributes)))
+    return geometry
+
+## A uniform draw in [0, 1) from a xorshift state.
+pub func draw(state: u64*) -> f64:
+    var x = *state
+    x ^= x << 13
+    x ^= x >> 7
+    x ^= x << 17
+    *state = x
+    return (f64)(x >> 11) / 9007199254740992.0
+
+## Whether two values are within `tolerance`.
+pub func near(a: f64, b: f64, tolerance: f64) -> bool:
+    return math.abs(a - b) <= tolerance

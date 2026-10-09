@@ -1,0 +1,76 @@
+## The luce-spz export: compact Gaussian splat files for Luce. Niantic's SPZ
+## (versions 1 to 4 read, 4 written by default) and antimatter15's `.splat`,
+## chosen by the path's extension. Loading gives a point cloud in a 3DGS
+## PLY's raw names and axes, which luce-geocore's Bake GSplats turns into its
+## splat conventions as it does a PLY's; saving takes such a cloud or a baked
+## one. The work is in reader.lucb, writer.lucb, container.lucb and
+## splat_file.lucb.
+import interop
+import memory
+from luce_geocore.geocore import GeometrySet
+from luce_geocore.kernel import adopt_set
+from warnings import Warnings
+from reader import decode
+from writer import encode, EncodeOptions
+from splat_file import decode_splat, encode_splat
+import source
+
+## The last load's or save's warnings on this thread, up to 4 KiB of whole lines.
+local var last_warnings: u8[4096]
+local var last_length: usize
+
+pub struct Spz:
+    let reserved: u8 = 0
+
+    ## The splat file at `path` (`.splat` by its extension, else SPZ) as a
+    ## point cloud: positions, `f_dc_0..2`, `opacity`, `scale_0..2`,
+    ## `rot_0..3` and the SH as one interleaved `f_rest` array, in RDF axes
+    ## like a PLY's; an SPZ's antialiased flag as detail `gsplat_antialiased`.
+    ## What was left out is in `warnings()`.
+    pub static func load(path: str) -> interop.Reference[GeometrySet]!:
+        var data = try source.read(path)
+        defer data.release()
+        var warnings = Warnings()
+        defer warnings.close()
+        let geometry = try decode_splat(data.value) if is_splat(path) else try decode(data.value, &warnings)
+        remember(&warnings)
+        return try adopt_set(geometry)
+
+    ## Write `geometry`'s splats to `path` (`.splat` by its extension, else
+    ## SPZ `version` 4, or 3 or 2): a cloud in the raw names, or a baked splat
+    ## cloud, which is unbaked first and written in SPZ's axes. What was left
+    ## out is in `warnings()`.
+    pub static func save(geometry: interop.Reference[GeometrySet], path: str, version: i64 = 4) -> !:
+        var warnings = Warnings()
+        defer warnings.close()
+        var data: u8[]
+        if is_splat(path):
+            data = try encode_splat(try geometry.get(), &warnings)
+        else:
+            var options = EncodeOptions()
+            options.version = (u32)version
+            data = try encode(try geometry.get(), &options, &warnings)
+        defer free(data) in memory.heap
+        try source.write(path, data)
+        remember(&warnings)
+
+    ## The warnings of this thread's last load or save, one per line.
+    pub static func warnings() -> interop.Owned[str]!:
+        return try interop.copy_text((str)last_warnings[..<last_length])
+
+## Whether `path` names a `.splat` file.
+func is_splat(path: str) -> bool:
+    let suffix = ".splat"
+    if path.length < suffix.length: return false
+    let tail = path.bytes[path.length - suffix.length..]
+    for at in 0..<suffix.length:
+        var byte = tail[at]
+        if byte >= 65 and byte <= 90: byte += 32
+        if byte != suffix.bytes[at]: return false
+    return true
+
+func remember(warnings: const Warnings*):
+    let text = warnings.text.view()
+    let length = text.length if text.length < last_warnings.length else last_warnings.length
+    memory.copy(last_warnings[..<length], text[..<length], length)
+    last_length = length

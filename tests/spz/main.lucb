@@ -1,0 +1,101 @@
+## luce-spz's checks: Niantic's reference files, malformed input, coordinate
+## systems, `.splat`, the editor's bake round trip and allocation failures.
+## Every check must free everything it allocated, and an allocation failing
+## anywhere must surface as memory.exhausted with nothing left allocated.
+import c
+import os
+import memory
+import sync
+from luce_std import parallel
+from luce_geocore.kernel import clear_group_cache
+import ownership
+import reference_checks
+import format_checks
+import splat_checks
+
+## Counts live blocks and fails the allocation after `remaining` more.
+struct Tracker: memory.Allocator:
+    var upstream: memory.Allocator
+    var live: usize
+    var remaining: usize?
+    var lock: sync.Mutex
+
+    pub func allocate(size: usize, alignment: usize) -> u8[]?:
+        if size == 0: return self.upstream.allocate(size, alignment)
+        self.lock.lock()
+        defer self.lock.unlock()
+        if let remaining = self.remaining:
+            if remaining == 0: return none
+            self.remaining = remaining - 1
+        let block = self.upstream.allocate(size, alignment) else return none
+        self.live += 1
+        return block
+
+    pub func resize(block: u8[], size: usize) -> bool:
+        return self.upstream.resize(block, size)
+
+    pub func release(block: u8[]):
+        if block.length == 0: return
+        self.lock.lock()
+        defer self.lock.unlock()
+        assert(self.live > 0)
+        self.live -= 1
+        self.upstream.release(block)
+
+func restore(previous: memory.Allocator):
+    memory.heap = previous
+
+## Nothing may stay live after a check.
+func settle(tracker: Tracker*, what: str):
+    tracker.remaining = none
+    clear_group_cache()
+    ownership.collect()
+    _ = ownership.finish_run(0)
+    if tracker.live != 0: print(f"{tracker.live} blocks still live after {what}")
+    assert(tracker.live == 0)
+
+## Fail each allocation of `check` in turn, until it runs through.
+func inject(tracker: Tracker*, check: func() -> unit!, what: str):
+    for stage in 0..<(usize)1000000:
+        tracker.remaining = stage
+        var failed = false
+        check() catch failure:
+            if failure.code != memory.exhausted: print(f"{what}: allocation {stage} failing gave: {failure.message}")
+            assert(failure.code == memory.exhausted)
+            failed = true
+        settle(tracker, what)
+        if not failed: return
+
+pub func main(arguments: str[]) -> i32!:
+    _ = arguments
+    if let here = os.env("LUC_TEST_DIR"):
+        try os.change_dir((c.str)here)
+    # Start the pool first: its starting threads free blocks in the current heap.
+    parallel.warm()
+    let previous = memory.heap
+    var tracker = Tracker(previous, 0, none, sync.Mutex())
+    memory.heap = &tracker
+    defer restore(previous)
+    try reference_checks.encodes_as_reference()
+    settle(&tracker, "encoding")
+    try reference_checks.decodes_reference()
+    settle(&tracker, "decoding")
+    try format_checks.malformed()
+    settle(&tracker, "malformed files")
+    try format_checks.version_one()
+    settle(&tracker, "version 1")
+    try format_checks.conversions()
+    settle(&tracker, "conversions")
+    try format_checks.extension()
+    settle(&tracker, "the coordinate extension")
+    try splat_checks.splat_round_trip()
+    settle(&tracker, ".splat")
+    try splat_checks.baked_round_trip()
+    settle(&tracker, "the bake round trip")
+    inject(&tracker, format_checks.version_one, "version 1")
+    inject(&tracker, splat_checks.splat_round_trip, ".splat")
+    inject(&tracker, reference_checks.encodes_as_reference, "encoding")
+    restore(previous)
+    try splat_checks.timings()
+    print("PASS luce-spz checks")
+    return 0

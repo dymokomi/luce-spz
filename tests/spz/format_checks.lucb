@@ -1,0 +1,155 @@
+## The container: malformed and truncated files fail (never trap), version 1's
+## f16 positions, and the coordinate system extension with conversions between
+## all sixteen systems.
+import memory
+import interop
+from luce_std import math32
+import strings
+from luce_geocore.geocore import Vector3
+from luce_geocore.kernel import GeometrySet, Domain, dispose_set, set_detail
+from luce_geocore.splats import sh_color
+from luce_compress import gzip
+from luce_spz.kernel import Warnings, Converter, decode, read_file, invalid, unsupported
+from support import expect, value, position, draw, near
+
+## Whether decoding `data` fails with `code` (and frees what it made).
+func fails_with(data: const u8[], code: ErrorCode) -> bool:
+    var warnings = Warnings()
+    defer warnings.close()
+    let made = decode(data, &warnings) catch failure:
+        return failure.code == code
+    dispose_set(made)
+    return false
+
+## Decoding `data` either fails cleanly or gives a set; never traps.
+func survives(data: const u8[]):
+    var warnings = Warnings()
+    defer warnings.close()
+    let made = decode(data, &warnings) catch failure:
+        expect(failure.code == invalid or failure.code == unsupported or failure.code == memory.exhausted, "damage fails as invalid")
+        return
+    dispose_set(made)
+
+func fixture(name: str) -> interop.Owned[const u8[]]!:
+    var room: u8[128]
+    return try read_file(try strings.format(room, f"../fixtures/{name}"))
+
+pub func malformed() -> !:
+    expect(fails_with(u8[]((u8*)0, 0), invalid), "an empty file is not SPZ")
+    var header: u8[32]
+    expect(fails_with(header, invalid), "zeros are not SPZ")
+    # NGSP, version 5.
+    let newer: u8[32] = [0x4e, 0x47, 0x53, 0x50, 5, 0, 0, 0, 1, 0, 0, 0, 0, 12, 0, 5, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    expect(fails_with(newer, unsupported), "a version past 4 is unsupported")
+    var file = try fixture("reference0_v4.spz")
+    defer file.release()
+    let bytes = file.value
+    # Every truncation of a version 4 file, and of a version 3 (gzip) one.
+    for length in 0..<bytes.length: expect(fails_with(bytes[..<length], invalid), "a truncated version 4 file is invalid")
+    var older = try fixture("reference0_v3.spz")
+    defer older.release()
+    for length in 0..<older.value.length: expect(fails_with(older.value[..<length], invalid), "a truncated version 3 file is invalid")
+    # A byte after the streams.
+    let longer = try new u8[bytes.length + 1] in memory.heap
+    defer free(longer) in memory.heap
+    memory.copy(longer[..<bytes.length], bytes, bytes.length)
+    expect(fails_with(longer, invalid), "bytes after the streams are invalid")
+    # Damage anywhere: fails or decodes, never traps.
+    var damaged = try new u8[bytes.length] in memory.heap
+    defer free(damaged) in memory.heap
+    var state: u64 = 77
+    for round in 0..<(usize)400:
+        memory.copy(damaged, bytes, bytes.length)
+        let at = (usize)(draw(&state) * (f64)bytes.length)
+        damaged[at] = damaged[at] ^ (u8)(1 + (usize)(draw(&state) * 255.0))
+        survives(damaged)
+    print("ok    malformed, truncated and damaged files fail cleanly")
+
+## A version 1 file by hand: f16 positions and first-three rotations, gzip.
+pub func version_one() -> !:
+    # Header, then two splats: positions (f16), alphas, colors, scales, rotations.
+    let plain: u8[48] = [0x4e, 0x47, 0x53, 0x50, 1, 0, 0, 0, 2, 0, 0, 0, 0, 12, 1, 0,
+                         0x00, 0x3c, 0x00, 0xc0, 0x00, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                         128, 255,
+                         127, 128, 255, 0, 64, 192,
+                         160, 160, 160, 0, 16, 32,
+                         128, 128, 128, 255, 128, 128]
+    let packed = try gzip.encode(plain)
+    defer free(packed) in memory.heap
+    var warnings = Warnings()
+    defer warnings.close()
+    let set = try decode(packed, &warnings)
+    defer dispose_set(set)
+    # RUB to RDF negates y and z: splat 0 stored at (1, -2, 0.5).
+    let p = position(set, 0)
+    expect(p.x == 1.0 and p.y == 2.0 and p.z == -0.5, "f16 positions, converted to RDF")
+    expect(near(value(set, "rot_0", 0), 1.0, 1.0e-4) and value(set, "rot_1", 0) == (f64)((f32)128.0 * (f32)(1.0 / 127.5) - 1.0), "first-three rotations with w from the rest")
+    expect(value(set, "scale_0", 1) == -10.0 and value(set, "scale_2", 1) == -8.0, "log scales")
+    let detail = set_detail(set)
+    expect(detail.find("gsplat_antialiased", Domain.detail) >= 0, "the antialiased flag is kept")
+    print("ok    version 1: f16 positions, first-three rotations, the antialiased flag")
+
+## Conversions: every system to RDF and back is the identity, and SH turned
+## with their splat keep their colors toward turned directions.
+pub func conversions() -> !:
+    var state: u64 = 5
+    for system in 1..<(u32)17:
+        let there = Converter.between(system, 6)
+        let back = Converter.between(6, system)
+        for round in 0..<(usize)8:
+            var sh: f32[45]
+            for at in 0..<(usize)45: sh[at] = (f32)(draw(&state) * 2.0 - 1.0)
+            var turned: f32[45] = sh
+            there.sh_items(turned, 15)
+            var d: f32[3] = [(f32)(draw(&state) - 0.5), (f32)(draw(&state) - 0.5), (f32)(draw(&state) - 0.5)]
+            let direction = try Vector3((f64)d[0], (f64)d[1], (f64)d[2]).normalized()
+            d = [(f32)direction.x, (f32)direction.y, (f32)direction.z]
+            var moved: f32[3] = d
+            there.position(moved)
+            let before = sh_color(Vector3(0.1, 0.2, 0.3), sh, 15, direction)
+            let after = sh_color(Vector3(0.1, 0.2, 0.3), turned, 15, Vector3((f64)moved[0], (f64)moved[1], (f64)moved[2]))
+            expect(near(before.x, after.x, 1.0e-4) and near(before.y, after.y, 1.0e-4) and near(before.z, after.z, 1.0e-4), "SH colors follow the conversion")
+            back.sh_items(turned, 15)
+            for at in 0..<(usize)45: expect(near((f64)turned[at], (f64)sh[at], 1.0e-5), "a conversion and its inverse give the SH back")
+            back.position(moved)
+            for k in 0..<(usize)3: expect(near((f64)moved[k], (f64)d[k], 1.0e-6), "a conversion and its inverse give positions back")
+            var q: f32[4] = [(f32)(draw(&state) - 0.5), (f32)(draw(&state) - 0.5), (f32)(draw(&state) - 0.5), (f32)(draw(&state) - 0.5)]
+            let length = math32.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
+            for k in 0..<(usize)4: q[k] = q[k] / length
+            var r: f32[4] = q
+            there.rotation(r)
+            back.rotation(r)
+            let dot = q[0] * r[0] + q[1] * r[1] + q[2] * r[2] + q[3] * r[3]
+            expect(math32.abs(dot) > 0.99999, "a conversion and its inverse give rotations back")
+    print("ok    16 coordinate systems: conversions invert, SH colors follow the axes")
+
+## The coordinate system extension: a version 4 file marked LUF (7) or RFU
+## (12) decodes to its positions in those axes, converted to RDF.
+pub func extension() -> !:
+    var file = try fixture("reference0_v4.spz")
+    defer file.release()
+    let bytes = file.value
+    var warnings = Warnings()
+    defer warnings.close()
+    let plain = try decode(bytes, &warnings)
+    defer dispose_set(plain)
+    for system in [(u32)7, (u32)12]:
+        # The header, a 12-byte record, then the table and streams as they were.
+        let marked = try new u8[bytes.length + 12] in memory.heap
+        defer free(marked) in memory.heap
+        memory.copy(marked[..<32], bytes[..<32], 32)
+        marked[14] = marked[14] | 2
+        marked[16] = 44
+        let record: u8[12] = [0x03, 0x00, 0xBE, 0xAD, 4, 0, 0, 0, (u8)system, 0, 0, 0]
+        memory.copy(marked[32..<44], record, 12)
+        memory.copy(marked[44..], bytes[32..], bytes.length - 32)
+        let set = try decode(marked, &warnings)
+        defer dispose_set(set)
+        for at in 0..<(usize)100:
+            # The stored values: RUB's decode undone (x, -y, -z).
+            let rdf = position(plain, at)
+            let s = Vector3(rdf.x, -rdf.y, -rdf.z)
+            let p = position(set, at)
+            if system == 7: expect(p.x == -s.x and p.y == -s.y and p.z == s.z, "LUF to RDF negates x and y")
+            else: expect(p.x == s.x and p.y == -s.z and p.z == s.y, "RFU to RDF turns about X")
+    print("ok    the coordinate system extension: LUF and RFU files decode to RDF")

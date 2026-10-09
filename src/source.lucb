@@ -1,0 +1,28 @@
+## Files on disk: reads map the whole file (pages come in as the decoder
+## touches them, and the parallel decode reads them on every core); writes
+## replace the file atomically.
+import c
+import interop
+import strings
+from luce_std import utf8, files
+
+## `path` as a NUL-terminated native string on memory.heap; release it with
+## strings.release.
+func native_path(path: str) -> str!:
+    if path.length == 0 or not utf8.valid(path.bytes):
+        error(files.invalid_options, "a path must be nonempty UTF-8")
+    for byte in path.bytes:
+        if byte == 0: error(files.invalid_options, "a path cannot contain NUL")
+    return try strings.copy(path)
+
+## The bytes of the file at `path`, mapped read-only; `release()` unmaps them.
+pub func read(path: str) -> interop.Owned[const u8[]]!:
+    let native = try native_path(path)
+    defer strings.release(native)
+    return try files.map((c.str)native)
+
+## Write `data` to `path`, replacing any file there atomically.
+pub func write(path: str, data: const u8[]) -> !:
+    let native = try native_path(path)
+    defer strings.release(native)
+    try files.write_atomic((c.str)native, data)

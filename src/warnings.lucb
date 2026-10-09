@@ -1,0 +1,31 @@
+## What a read or a write left out, one line each, for the caller to show.
+from luce_geocore.core.growing import Growing
+
+## Warning lines, each ending in a line feed, at most 4 KiB of them; a line
+## already present is not repeated.
+pub struct Warnings:
+    pub var text: Growing[u8]
+
+    ## Add `line` unless it is already there or the text is full.
+    pub func add(line: str) -> !:
+        if self.text.count + line.length + 1 > 4096: return
+        if self.contains(line): return
+        for byte in line.bytes: try self.text.push(byte)
+        try self.text.push(10)
+
+    ## Whether `line` is one of the lines.
+    pub func contains(line: str) -> bool:
+        var start: usize = 0
+        let bytes = self.text.view()
+        for at in 0..<bytes.length:
+            if bytes[at] != 10: continue
+            if (str)bytes[start..<at] == line: return true
+            start = at + 1
+        return false
+
+    ## The lines as text.
+    pub func view() -> str:
+        return (str)self.text.view()
+
+    pub func close():
+        self.text.close()

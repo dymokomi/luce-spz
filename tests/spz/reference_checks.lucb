@@ -1,0 +1,96 @@
+## Against Niantic's reference library: the fixtures were written by it
+## (tests/fixtures/README.md) from synthetic PLYs. Encoding a PLY gives the
+## reference's streams byte for byte in versions 2 to 4, decoding a reference
+## file gives its PLY back within the format's quantization, and decoding and
+## encoding again gives the same streams.
+import memory
+import strings
+import support
+from luce_std import math
+from luce_geocore.kernel import GeometrySet, dispose_set
+from luce_geocore.splats import sigmoid
+from luce_spz.kernel import Warnings, EncodeOptions, Packed, encode, decode, read_file
+from support import expect, fixture_cloud, fixture_packed, packed_of, same_packed, value, position, rest, rest_items, near
+
+## The reference file pairs: a source PLY, the file written from it, its version.
+struct Pair:
+    let source: str
+    let written: str
+    let version: u32
+
+let pairs: Pair[5] = [Pair("synthetic3.ply", "reference3_v2.spz", 2), Pair("synthetic3.ply", "reference3_v3.spz", 3), Pair("synthetic3.ply", "reference3_v4.spz", 4), Pair("synthetic0.ply", "reference0_v3.spz", 3), Pair("synthetic0.ply", "reference0_v4.spz", 4)]
+
+## Our encoding of each source equals the reference's.
+pub func encodes_as_reference() -> !:
+    for pair in pairs:
+        let source = try fixture_cloud(pair.source)
+        defer dispose_set(source)
+        var options = EncodeOptions()
+        options.version = pair.version
+        var warnings = Warnings()
+        defer warnings.close()
+        let bytes = try encode(source, &options, &warnings)
+        defer free(bytes) in memory.heap
+        var ours = try packed_of(bytes)
+        defer ours.close()
+        var theirs = try fixture_packed(pair.written)
+        defer theirs.close()
+        expect(same_packed(&ours, &theirs), "encoding a PLY gives the reference's streams")
+    print("ok    encoding matches Niantic's packer byte for byte (v2, v3, v4; SH degrees 3 and 0)")
+
+## Each reference file decodes to its source within the quantization, and
+## encodes back to the same streams.
+pub func decodes_reference() -> !:
+    for pair in pairs:
+        let source = try fixture_cloud(pair.source)
+        defer dispose_set(source)
+        var room: u8[128]
+        var file = try read_file(try strings.format(room, f"../fixtures/{pair.written}"))
+        defer file.release()
+        var warnings = Warnings()
+        defer warnings.close()
+        let decoded = try decode(file.value, &warnings)
+        defer dispose_set(decoded)
+        try within_quantization(source, decoded, pair.version)
+        var options = EncodeOptions()
+        options.version = pair.version
+        let bytes = try encode(decoded, &options, &warnings)
+        defer free(bytes) in memory.heap
+        var again = try packed_of(bytes)
+        defer again.close()
+        var theirs = try packed_of(file.value)
+        defer theirs.close()
+        expect(same_packed(&again, &theirs), "a decoded file encodes back to the same streams")
+    print("ok    reference files decode within quantization and encode back to their streams")
+
+## `decoded` is `source` up to SPZ's quantization: positions to 2^-13, colors
+## to half a byte, log scales to 1/32, opacities to half a byte, rotations to
+## their bits, SH to half a bucket.
+func within_quantization(source: const GeometrySet*, decoded: const GeometrySet*, version: u32) -> !:
+    let count = support.cloud_of(source).count()
+    expect(support.cloud_of(decoded).count() == count, "the splat count")
+    let items = rest_items(source)
+    expect(rest_items(decoded) == items, "the SH items")
+    for at in 0..<count:
+        let a = position(source, at)
+        let b = position(decoded, at)
+        expect(near(a.x, b.x, 1.3e-4) and near(a.y, b.y, 1.3e-4) and near(a.z, b.z, 1.3e-4), "positions to 2^-13")
+        for k in 0..<(usize)3:
+            expect(near(value(source, support.raw_names[k], at), value(decoded, support.raw_names[k], at), 0.5 / (0.15 * 255.0) + 1.0e-5), "colors to half a byte")
+            expect(near(value(source, support.raw_names[4 + k], at), value(decoded, support.raw_names[4 + k], at), 1.0 / 32.0 + 1.0e-5), "log scales to 1/32")
+        expect(near(sigmoid(value(source, "opacity", at)), sigmoid(value(decoded, "opacity", at)), 0.5 / 255.0 + 1.0e-6), "opacities to half a byte")
+        var dot: f64 = 0.0
+        var length_a: f64 = 0.0
+        var length_b: f64 = 0.0
+        for k in 0..<(usize)4:
+            let x = value(source, support.raw_names[7 + k], at)
+            let y = value(decoded, support.raw_names[7 + k], at)
+            dot += x * y
+            length_a += x * x
+            length_b += y * y
+        let cosine = math.abs(dot) / math.sqrt(length_a * length_b)
+        expect(cosine > (0.9995 if version >= 3 else 0.995), "rotations to their bits")
+        for item in 0..<items:
+            for channel in 0..<(usize)3:
+                let tolerance = (4.5 if item < 3 else 8.5) / 128.0
+                expect(near(rest(source, at, item, channel), rest(decoded, at, item, channel), tolerance), "SH to half a bucket")
