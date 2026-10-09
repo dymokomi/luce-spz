@@ -62,6 +62,31 @@ pub func baked_round_trip() -> !:
     expect(same_packed(&again, &theirs), "decode, Bake GSplats and encode give the file's streams back")
     print("ok    decoded, baked (Y down) and encoded: the same streams")
 
+## The zstd level: 3 by default; levels 1 and 9 write the same streams, 9 no
+## larger.
+pub func levels() -> !:
+    let source = try seeded_cloud(20000, 15, 7)
+    defer dispose_set(source)
+    var warnings = Warnings()
+    defer warnings.close()
+    var options = EncodeOptions()
+    expect(options.level == 3, "level 3 by default")
+    let usual = try encode(source, &options, &warnings)
+    defer free(usual) in memory.heap
+    var streams = try packed_of(usual)
+    defer streams.close()
+    var sizes: usize[2] = [0, 0]
+    for at in 0..<(usize)2:
+        options.level = 1 if at == 0 else 9
+        let bytes = try encode(source, &options, &warnings)
+        defer free(bytes) in memory.heap
+        var packed = try packed_of(bytes)
+        defer packed.close()
+        expect(same_packed(&packed, &streams), "every level writes the same streams")
+        sizes[at] = bytes.length
+    expect(sizes[1] <= usual.length, "level 9 is no larger than level 3")
+    print(f"ok    zstd levels: 1 writes {sizes[0]} bytes, 3 (default) {usual.length}, 9 {sizes[1]}")
+
 ## A million degree-3 splats encoded (version 4) and decoded, timed.
 pub func timings() -> !:
     let count: usize = 1000000

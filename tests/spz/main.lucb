@@ -92,6 +92,8 @@ pub func main(arguments: str[]) -> i32!:
     settle(&tracker, ".splat")
     try splat_checks.baked_round_trip()
     settle(&tracker, "the bake round trip")
+    try splat_checks.levels()
+    settle(&tracker, "zstd levels")
     inject(&tracker, format_checks.version_one, "version 1")
     inject(&tracker, splat_checks.splat_round_trip, ".splat")
     inject(&tracker, reference_checks.encodes_as_reference, "encoding")

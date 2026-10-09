@@ -14,6 +14,7 @@ from reader import decode
 from writer import encode, EncodeOptions
 from splat_file import decode_splat, encode_splat
 import source
+import errors
 
 ## The last load's or save's warnings on this thread, up to 4 KiB of whole lines.
 local var last_warnings: u8[4096]
@@ -40,7 +41,7 @@ pub struct Spz:
     ## SPZ `version` 4, or 3 or 2): a cloud in the raw names, or a baked splat
     ## cloud, which is unbaked first and written in SPZ's axes. What was left
     ## out is in `warnings()`.
-    pub static func save(geometry: interop.Reference[GeometrySet], path: str, version: i64 = 4) -> !:
+    pub static func save(geometry: interop.Reference[GeometrySet], path: str, version: i64 = 4, level: i64 = 3) -> !:
         var warnings = Warnings()
         defer warnings.close()
         var data: u8[]
@@ -49,6 +50,8 @@ pub struct Spz:
         else:
             var options = EncodeOptions()
             options.version = (u32)version
+            if level < 1 or level > 22: error(errors.invalid, "the zstd level is 1 to 22")
+            options.level = (i32)level
             data = try encode(try geometry.get(), &options, &warnings)
         defer free(data) in memory.heap
         try source.write(path, data)

@@ -28,8 +28,11 @@ pub struct EncodeOptions:
     ## bits compress better.
     pub var sh1_bits: u32 = 5
     pub var rest_bits: u32 = 4
-    ## The zstd level of version 4's streams.
-    pub var level: i32 = 12
+    ## The zstd level of version 4's streams (luce-compress's 1 to 9; higher
+    ## levels write as 9). On the 1.16M-splat Mip-NeRF 360 bonsai, level 3
+    ## encodes in 0.15 s to 23.6 MB and level 9 in 0.58 s to 22.7 MB (4% less):
+    ## 3 by default, as zstd's own default.
+    pub var level: i32 = 3
 
 ## The SPZ file of `geometry`'s splats, on memory.heap (the caller frees it).
 pub func encode(geometry: const GeometrySet*, options: const EncodeOptions*, warnings: Warnings*) -> u8[]!:
