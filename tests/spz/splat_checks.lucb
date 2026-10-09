@@ -48,7 +48,7 @@ pub func baked_round_trip() -> !:
     defer dispose_set(raw)
     let verb = find_set_verb("Bake GSplats") else trap("Bake GSplats is missing")
     let numbers: f64[7] = [0.0, 0.0, 3.0, 1.0, 0.05, 1.0, 0.0]
-    var output = try run_set_verb(&verb, raw, none, "", 0, numbers)
+    var output = try run_set_verb(&verb, raw, none, "", 0, numbers, [""])
     let baked = output.set else trap("Bake made no set")
     output.set = none
     defer dispose_set(baked)
